@@ -1,37 +1,50 @@
 # rotate-backups: Simple command line interface for backup rotation.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: August 30, 2015
+# Last Change: August 5, 2016
 # URL: https://github.com/xolox/python-rotate-backups
 
 """
+Simple to use Python API for rotation of backups.
+
 The :mod:`rotate_backups` module contains the Python API of the
 `rotate-backups` package. The core logic of the package is contained in the
 :class:`RotateBackups` class.
 """
 
-# Semi-standard module versioning.
-__version__ = '2.3'
-
 # Standard library modules.
 import collections
 import datetime
 import fnmatch
-import functools
-import logging
+import numbers
 import os
 import re
 
 # External dependencies.
 from dateutil.relativedelta import relativedelta
-from executor import execute
-from humanfriendly import format_path, parse_path, Timer
-from humanfriendly.text import concatenate, split
+from executor.concurrent import CommandPool
+from executor.contexts import RemoteContext, create_context
+from humanfriendly import Timer, coerce_boolean, format_path, parse_path, pluralize
+from humanfriendly.text import compact, concatenate, split
 from natsort import natsort
+from property_manager import (
+    PropertyManager,
+    cached_property,
+    key_property,
+    lazy_property,
+    mutable_property,
+    required_property,
+)
+from simpleeval import simple_eval
+from six import string_types
 from six.moves import configparser
+from verboselogs import VerboseLogger
+
+# Semi-standard module versioning.
+__version__ = '4.2'
 
 # Initialize a logger for this module.
-logger = logging.getLogger(__name__)
+logger = VerboseLogger(__name__)
 
 GLOBAL_CONFIG_FILE = '/etc/rotate-backups.ini'
 """The pathname of the system wide configuration file (a string)."""
@@ -39,11 +52,14 @@ GLOBAL_CONFIG_FILE = '/etc/rotate-backups.ini'
 LOCAL_CONFIG_FILE = '~/.rotate-backups.ini'
 """The pathname of the user specific configuration file (a string)."""
 
-ORDERED_FREQUENCIES = (('hourly', relativedelta(hours=1)),
-                       ('daily', relativedelta(days=1)),
-                       ('weekly', relativedelta(weeks=1)),
-                       ('monthly', relativedelta(months=1)),
-                       ('yearly', relativedelta(years=1)))
+ORDERED_FREQUENCIES = (
+    ('minutely', relativedelta(minutes=1)),
+    ('hourly', relativedelta(hours=1)),
+    ('daily', relativedelta(days=1)),
+    ('weekly', relativedelta(weeks=1)),
+    ('monthly', relativedelta(months=1)),
+    ('yearly', relativedelta(years=1)),
+)
 """
 A list of tuples with two values each:
 
@@ -78,158 +94,349 @@ filenames.
 """
 
 
+def coerce_location(value, **options):
+    """
+    Coerce a string to a :class:`Location` object.
+
+    :param value: The value to coerce (a string or :class:`Location` object).
+    :param options: Any keyword arguments are passed on to
+                    :func:`~executor.contexts.create_context()`.
+    :returns: A :class:`Location` object.
+    """
+    # Location objects pass through untouched.
+    if not isinstance(value, Location):
+        # Other values are expected to be strings.
+        if not isinstance(value, string_types):
+            msg = "Expected Location object or string, got %s instead!"
+            raise ValueError(msg % type(value))
+        # Try to parse a remote location.
+        ssh_alias, _, directory = value.partition(':')
+        if ssh_alias and directory and '/' not in ssh_alias:
+            options['ssh_alias'] = ssh_alias
+        else:
+            directory = value
+        # Create the location object.
+        value = Location(
+            context=create_context(**options),
+            directory=parse_path(directory),
+        )
+    return value
+
+
 def coerce_retention_period(value):
     """
     Coerce a retention period to a Python value.
 
-    :param value: A string containing an integer number or the text 'always'.
-    :returns: An integer number or the string 'always'.
+    :param value: A string containing the text 'always', a number or
+                  an expression that can be evaluated to a number.
+    :returns: A number or the string 'always'.
     :raises: :exc:`~exceptions.ValueError` when the string can't be coerced.
     """
-    value = value.strip()
-    if value.lower() == 'always':
-        return 'always'
-    elif value.isdigit():
-        return int(value)
-    else:
-        raise ValueError("Invalid retention period! (%s)" % value)
+    # Numbers pass through untouched.
+    if not isinstance(value, numbers.Number):
+        # Other values are expected to be strings.
+        if not isinstance(value, string_types):
+            msg = "Expected string, got %s instead!"
+            raise ValueError(msg % type(value))
+        # Check for the literal string `always'.
+        value = value.strip()
+        if value.lower() == 'always':
+            value = 'always'
+        else:
+            # Evaluate other strings as expressions.
+            value = simple_eval(value)
+            if not isinstance(value, numbers.Number):
+                msg = "Expected numeric result, got %s instead!"
+                raise ValueError(msg % type(value))
+    return value
 
 
 def load_config_file(configuration_file=None):
     """
-    used by :class:`RotateBackups` to discover rotation schemes and by
-    :func:`rotate_all_backups()` to discover directories with backups.
+    Load a configuration file with backup directories and rotation schemes.
+
+    :param configuration_file: Override the pathname of the configuration file
+                               to load (a string or :data:`None`).
+    :returns: A generator of tuples with four values each:
+
+              1. An execution context created using :mod:`executor.contexts`.
+              2. The pathname of a directory with backups (a string).
+              3. A dictionary with the rotation scheme.
+              4. A dictionary with additional options.
+    :raises: :exc:`~exceptions.ValueError` when `configuration_file` is given
+             but doesn't exist or can't be loaded.
+
+    When `configuration_file` isn't given :data:`LOCAL_CONFIG_FILE` and
+    :data:`GLOBAL_CONFIG_FILE` are checked and the first configuration file
+    that exists is loaded. This function is used by :class:`RotateBackups` to
+    discover user defined rotation schemes and by :mod:`rotate_backups.cli` to
+    discover directories for which backup rotation is configured.
     """
     parser = configparser.RawConfigParser()
     if configuration_file:
-        logger.debug("Using custom configuration file: %s", format_path(configuration_file))
+        logger.verbose("Reading configuration file %s ..", format_path(configuration_file))
         loaded_files = parser.read(configuration_file)
         if len(loaded_files) == 0:
             msg = "Failed to read configuration file! (%s)"
             raise ValueError(msg % configuration_file)
     else:
-        for config_file in [LOCAL_CONFIG_FILE, GLOBAL_CONFIG_FILE]:
+        for config_file in LOCAL_CONFIG_FILE, GLOBAL_CONFIG_FILE:
             pathname = parse_path(config_file)
             if parser.read(pathname):
-                logger.debug("Using configuration file %s ..", format_path(pathname))
+                logger.verbose("Reading configuration file %s ..", format_path(pathname))
                 break
     for section in parser.sections():
-        directory = parse_path(section)
-        if os.path.isdir(directory):
-            options = dict(parser.items(section))
-            yield (directory,
-                   dict((name, coerce_retention_period(options[name]))
-                        for name in SUPPORTED_FREQUENCIES
-                        if name in options),
-                   dict(include_list=split(options.get('include-list', '')),
-                        exclude_list=split(options.get('exclude-list', '')),
-                        io_scheduling_class=options.get('ionice')))
+        items = dict(parser.items(section))
+        context_options = {}
+        if coerce_boolean(items.get('use-sudo')):
+            context_options['sudo'] = True
+        if items.get('ssh-user'):
+            context_options['ssh_user'] = items['ssh-user']
+        location = coerce_location(section, **context_options)
+        rotation_scheme = dict((name, coerce_retention_period(items[name]))
+                               for name in SUPPORTED_FREQUENCIES
+                               if name in items)
+        options = dict(include_list=split(items.get('include-list', '')),
+                       exclude_list=split(items.get('exclude-list', '')),
+                       io_scheduling_class=items.get('ionice'),
+                       strict=coerce_boolean(items.get('strict', 'yes')),
+                       prefer_recent=coerce_boolean(items.get('prefer-recent', 'no')))
+        yield location, rotation_scheme, options
 
 
-def rotate_backups(directory, rotation_scheme, include_list=None, exclude_list=None,
-                   dry_run=False, io_scheduling_class=None):
+def rotate_backups(directory, rotation_scheme, **options):
     """
     Rotate the backups in a directory according to a flexible rotation scheme.
 
     .. note:: This function exists to preserve backwards compatibility with
               older versions of the `rotate-backups` package where all of the
               logic was exposed as a single function. Please refer to the
-              documentation of the :class:`RotateBackups` constructor and the
+              documentation of the :class:`RotateBackups` initializer and the
               :func:`~RotateBackups.rotate_backups()` method for an explanation
               of this function's parameters.
     """
-    RotateBackups(
-        rotation_scheme=rotation_scheme,
-        include_list=include_list,
-        exclude_list=exclude_list,
-        dry_run=dry_run,
-        io_scheduling_class=io_scheduling_class,
-    ).rotate_backups(directory)
+    program = RotateBackups(rotation_scheme=rotation_scheme, **options)
+    program.rotate_backups(directory)
 
 
-class RotateBackups(object):
+class RotateBackups(PropertyManager):
 
     """Python API for the ``rotate-backups`` program."""
 
-    def __init__(self, rotation_scheme, include_list=None, exclude_list=None,
-                 dry_run=False, io_scheduling_class=None, config_file=None):
+    def __init__(self, rotation_scheme, **options):
         """
-        Construct a :class:`RotateBackups` object.
+        Initialize a :class:`RotateBackups` object.
 
-        :param rotation_scheme: A dictionary with one or more of the keys 'hourly',
-                                'daily', 'weekly', 'monthly', 'yearly'. Each key is
-                                expected to have one of the following values:
-
-                                - An integer gives the number of backups in the
-                                  corresponding category to preserve, starting from
-                                  the most recent backup and counting back in
-                                  time.
-                                - The string 'always' means all backups in the
-                                  corresponding category are preserved (useful for
-                                  the biggest time unit in the rotation scheme).
-
-                                By default no backups are preserved for categories
-                                (keys) not present in the dictionary.
-        :param include_list: A list of strings with :mod:`fnmatch` patterns. If a
-                             nonempty include list is specified each backup must
-                             match a pattern in the include list, otherwise it
-                             will be ignored.
-        :param exclude_list: A list of strings with :mod:`fnmatch` patterns. If a
-                             backup matches the exclude list it will be ignored,
-                             *even if it also matched the include list* (it's the
-                             only logical way to combine both lists).
-        :param dry_run: If this is ``True`` then no changes will be made, which
-                        provides a 'preview' of the effect of the rotation scheme
-                        (the default is ``False``). Right now this is only useful
-                        in the command line interface because there's no return
-                        value.
-        :param io_scheduling_class: Use ``ionice`` to set the I/O scheduling class
-                                    (expected to be one of the strings 'idle',
-                                    'best-effort' or 'realtime').
-        :param config_file: The pathname of a configuration file (a string).
+        :param rotation_scheme: Used to set :attr:`rotation_scheme`.
+        :param options: Any keyword arguments are used to set the values of the
+                        properties :attr:`config_file`, :attr:`dry_run`,
+                        :attr:`exclude_list`, :attr:`include_list`,
+                        :attr:`io_scheduling_class` and :attr:`strict`.
         """
-        self.rotation_scheme = rotation_scheme
-        self.include_list = include_list
-        self.exclude_list = exclude_list
-        self.dry_run = dry_run
-        self.io_scheduling_class = io_scheduling_class
-        self.config_file = config_file
+        options.update(rotation_scheme=rotation_scheme)
+        super(RotateBackups, self).__init__(**options)
 
-    def rotate_backups(self, directory, load_config=True):
+    @mutable_property
+    def config_file(self):
+        """
+        The pathname of a configuration file (a string or :data:`None`).
+
+        When this property is set :func:`rotate_backups()` will use
+        :func:`load_config_file()` to give the user (operator) a chance to set
+        the rotation scheme and other options via a configuration file.
+        """
+
+    @mutable_property
+    def dry_run(self):
+        """
+        :data:`True` to simulate rotation, :data:`False` to actually remove backups (defaults to :data:`False`).
+
+        If this is :data:`True` then :func:`rotate_backups()` won't make any
+        actual changes, which provides a 'preview' of the effect of the
+        rotation scheme. Right now this is only useful in the command line
+        interface because there's no return value.
+        """
+        return False
+
+    @cached_property(writable=True)
+    def exclude_list(self):
+        """
+        Filename patterns to exclude specific backups (a list of strings).
+
+        This is a list of strings with :mod:`fnmatch` patterns. When
+        :func:`collect_backups()` encounters a backup whose name matches any of
+        the patterns in this list the backup will be ignored, *even if it also
+        matches the include list* (it's the only logical way to combine both
+        lists).
+
+        :see also: :attr:`include_list`
+        """
+        return []
+
+    @cached_property(writable=True)
+    def include_list(self):
+        """
+        Filename patterns to select specific backups (a list of strings).
+
+        This is a list of strings with :mod:`fnmatch` patterns. When it's not
+        empty :func:`collect_backups()` will only collect backups whose name
+        matches a pattern in the list.
+
+        :see also: :attr:`exclude_list`
+        """
+        return []
+
+    @mutable_property
+    def io_scheduling_class(self):
+        """
+        The I/O scheduling class for backup rotation (a string or :data:`None`).
+
+        When this property is set then ``ionice`` will be used to set the I/O
+        scheduling class for backup rotation. This can be useful to reduce the
+        impact of backup rotation on the rest of the system.
+
+        The value of this property is expected to be one of the strings 'idle',
+        'best-effort' or 'realtime'.
+        """
+
+    @mutable_property
+    def prefer_recent(self):
+        """
+        Whether to prefer older or newer backups in each time slot (a boolean).
+
+        Defaults to :data:`False` which means the oldest backup in each time
+        slot (an hour, a day, etc.) is preserved while newer backups in the
+        time slot are removed. You can set this to :data:`True` if you would
+        like to preserve the newest backup in each time slot instead.
+        """
+        return False
+
+    @required_property
+    def rotation_scheme(self):
+        """
+        The rotation scheme to apply to backups (a dictionary).
+
+        Each key in this dictionary defines a rotation frequency (one of the
+        strings 'minutely', 'hourly', 'daily', 'weekly', 'monthly' and
+        'yearly') and each value defines a retention count:
+
+        - An integer value represents the number of backups to preserve in the
+          given rotation frequency, starting from the most recent backup and
+          counting back in time.
+
+        - The string 'always' means all backups in the given rotation frequency
+          are preserved (this is intended to be used with the biggest frequency
+          in the rotation scheme, e.g. yearly).
+
+        No backups are preserved for rotation frequencies that are not present
+        in the dictionary.
+        """
+
+    @mutable_property
+    def strict(self):
+        """
+        Whether to enforce the time window for each rotation frequency (a boolean, defaults to :data:`True`).
+
+        The easiest way to explain the difference between strict and relaxed
+        rotation is using an example:
+
+        - If :attr:`strict` is :data:`True` and the number of hourly backups to
+          preserve is three, only backups created in the relevant time window
+          (the hour of the most recent backup and the two hours leading up to
+          that) will match the hourly frequency.
+
+        - If :attr:`strict` is :data:`False` then the three most recent backups
+          will all match the hourly frequency (and thus be preserved),
+          regardless of the calculated time window.
+
+        If the explanation above is not clear enough, here's a simple way to
+        decide whether you want to customize this behavior:
+
+        - If your backups are created at regular intervals and you never miss
+          an interval then the default (:data:`True`) is most likely fine.
+
+        - If your backups are created at irregular intervals then you may want
+          to set :attr:`strict` to :data:`False` to convince
+          :class:`RotateBackups` to preserve more backups.
+        """
+        return True
+
+    def rotate_concurrent(self, *locations, **kw):
+        """
+        Rotate the backups in the given locations concurrently.
+
+        :param locations: One or more values accepted by :func:`coerce_location()`.
+        :param kw: Any keyword arguments are passed on to :func:`rotate_backups()`.
+
+        This function uses :func:`rotate_backups()` to prepare rotation
+        commands for the given locations and then it removes backups in
+        parallel, one backup per mount point at a time.
+
+        The idea behind this approach is that parallel rotation is most useful
+        when the files to be removed are on different disks and so multiple
+        devices can be utilized at the same time.
+
+        Because mount points are per system :func:`rotate_concurrent()` will
+        also parallelize over backups located on multiple remote systems.
+        """
+        timer = Timer()
+        pool = CommandPool(concurrency=10)
+        logger.info("Scanning %s ..", pluralize(len(locations), "backup location"))
+        for location in locations:
+            for cmd in self.rotate_backups(location, prepare=True, **kw):
+                pool.add(cmd)
+        if pool.num_commands > 0:
+            backups = pluralize(pool.num_commands, "backup")
+            logger.info("Preparing to rotate %s (in parallel) ..", backups)
+            pool.run()
+            logger.info("Successfully rotated %s in %s.", backups, timer)
+
+    def rotate_backups(self, location, load_config=True, prepare=False):
         """
         Rotate the backups in a directory according to a flexible rotation scheme.
 
-        :param directory: The pathname of a directory that contains backups to
-                          rotate (a string).
+        :param location: Any value accepted by :func:`coerce_location()`.
         :param load_config: If :data:`True` (so by default) the rotation scheme
                             and other options can be customized by the user in
                             a configuration file. In this case the caller's
                             arguments are only used when the configuration file
-                            doesn't define a configuration for the directory.
+                            doesn't define a configuration for the location.
+        :param prepare: If this is :data:`True` (not the default) then
+                        :func:`rotate_backups()` will prepare the required
+                        rotation commands without running them.
+        :returns: A list with the rotation commands (:class:`ExternalCommand`
+                  objects).
+        :raises: :exc:`~exceptions.ValueError` when the given location doesn't
+                 exist, isn't readable or isn't writable. The third check is
+                 only performed when dry run isn't enabled.
 
-        .. note:: This function binds the main methods of the
-                  :class:`RotateBackups` class together to implement backup
-                  rotation with an easy to use Python API. If you're using
-                  `rotate-backups` as a Python API and the default behavior is
-                  not satisfactory, consider writing your own
-                  :func:`rotate_backups()` function based on the underlying
-                  :func:`collect_backups()`, :func:`group_backups()`,
-                  :func:`apply_rotation_scheme()` and
-                  :func:`find_preservation_criteria()` methods.
+        This function binds the main methods of the :class:`RotateBackups`
+        class together to implement backup rotation with an easy to use Python
+        API. If you're using `rotate-backups` as a Python API and the default
+        behavior is not satisfactory, consider writing your own
+        :func:`rotate_backups()` function based on the underlying
+        :func:`collect_backups()`, :func:`group_backups()`,
+        :func:`apply_rotation_scheme()` and
+        :func:`find_preservation_criteria()` methods.
         """
+        rotation_commands = []
+        location = coerce_location(location)
         # Load configuration overrides by user?
         if load_config:
-            self.load_config_file(directory)
+            location = self.load_config_file(location)
         # Collect the backups in the given directory.
-        sorted_backups = self.collect_backups(directory)
+        sorted_backups = self.collect_backups(location)
         if not sorted_backups:
-            logger.info("No backups found in %s.", format_path(directory))
+            logger.info("No backups found in %s.", location)
             return
+        # Make sure the directory is writable.
+        if not self.dry_run:
+            location.ensure_writable()
         most_recent_backup = sorted_backups[-1]
         # Group the backups by the rotation frequencies.
         backups_by_frequency = self.group_backups(sorted_backups)
         # Apply the user defined rotation scheme.
-        self.apply_rotation_scheme(backups_by_frequency, most_recent_backup.datetime)
+        self.apply_rotation_scheme(backups_by_frequency, most_recent_backup.timestamp)
         # Find which backups to preserve and why.
         backups_to_preserve = self.find_preservation_criteria(backups_by_frequency)
         # Apply the calculated rotation scheme.
@@ -241,64 +448,72 @@ class RotateBackups(object):
                             concatenate(map(repr, matching_periods)),
                             "period" if len(matching_periods) == 1 else "periods")
             else:
-                logger.info("Deleting %s %s ..", backup.type, format_path(backup.pathname))
+                logger.info("Deleting %s ..", format_path(backup.pathname))
                 if not self.dry_run:
-                    command = ['rm', '-Rf', backup.pathname]
+                    command_line = ['rm', '-Rf', backup.pathname]
                     if self.io_scheduling_class:
-                        command = ['ionice', '--class', self.io_scheduling_class] + command
-                    timer = Timer()
-                    execute(*command, logger=logger)
-                    logger.debug("Deleted %s in %s.", format_path(backup.pathname), timer)
+                        command_line = ['ionice', '--class', self.io_scheduling_class] + command_line
+                    group_by = (location.ssh_alias, location.mount_point)
+                    command = location.context.prepare(*command_line, group_by=group_by)
+                    rotation_commands.append(command)
+                    if not prepare:
+                        timer = Timer()
+                        command.wait()
+                        logger.verbose("Deleted %s in %s.", format_path(backup.pathname), timer)
         if len(backups_to_preserve) == len(sorted_backups):
             logger.info("Nothing to do! (all backups preserved)")
+        return rotation_commands
 
-    def load_config_file(self, directory):
+    def load_config_file(self, location):
         """
         Load a rotation scheme and other options from a configuration file.
 
-        :param directory: The pathname of the directory to match (a string).
-        :param config_file: The pathname of a configuration file (a string or
-                            :data:`None`).
+        :param location: Any value accepted by :func:`coerce_location()`.
+        :returns: The configured or given :class:`Location` object.
         """
-        directory = os.path.realpath(directory)
-        for other_directory, rotation_scheme, options in load_config_file(self.config_file):
-            if directory == os.path.realpath(other_directory):
+        location = coerce_location(location)
+        for configured_location, rotation_scheme, options in load_config_file(self.config_file):
+            if location == configured_location:
+                logger.verbose("Loading configuration for %s ..", location)
                 if rotation_scheme:
                     self.rotation_scheme = rotation_scheme
                 for name, value in options.items():
                     if value:
                         setattr(self, name, value)
-                break
+                return configured_location
+        logger.verbose("No configuration found for %s.", location)
+        return location
 
-    def collect_backups(self, directory):
+    def collect_backups(self, location):
         """
-        Collect the backups in the given directory.
+        Collect the backups at the given location.
 
-        :param directory: The pathname of an existing directory (a string).
+        :param location: Any value accepted by :func:`coerce_location()`.
         :returns: A sorted :class:`list` of :class:`Backup` objects (the
                   backups are sorted by their date).
+        :raises: :exc:`~exceptions.ValueError` when the given directory doesn't
+                 exist or isn't readable.
         """
         backups = []
-        directory = os.path.abspath(directory)
-        logger.info("Scanning directory for backups: %s", format_path(directory))
-        for entry in natsort(os.listdir(directory)):
-            # Check for a time stamp in the directory entry's name.
+        location = coerce_location(location)
+        logger.info("Scanning %s for backups ..", location)
+        location.ensure_readable()
+        for entry in natsort(location.context.list_entries(location.directory)):
             match = TIMESTAMP_PATTERN.search(entry)
             if match:
-                # Make sure the entry matches the given include/exclude patterns.
                 if self.exclude_list and any(fnmatch.fnmatch(entry, p) for p in self.exclude_list):
-                    logger.debug("Excluded %r (it matched the exclude list).", entry)
+                    logger.verbose("Excluded %r (it matched the exclude list).", entry)
                 elif self.include_list and not any(fnmatch.fnmatch(entry, p) for p in self.include_list):
-                    logger.debug("Excluded %r (it didn't match the include list).", entry)
+                    logger.verbose("Excluded %r (it didn't match the include list).", entry)
                 else:
                     backups.append(Backup(
-                        pathname=os.path.join(directory, entry),
-                        datetime=datetime.datetime(*(int(group, 10) for group in match.groups('0'))),
+                        pathname=os.path.join(location.directory, entry),
+                        timestamp=datetime.datetime(*(int(group, 10) for group in match.groups('0'))),
                     ))
             else:
                 logger.debug("Failed to match time stamp in filename: %s", entry)
         if backups:
-            logger.info("Found %i timestamped backups in %s.", len(backups), format_path(directory))
+            logger.info("Found %i timestamped backups in %s.", len(backups), location)
         return sorted(backups)
 
     def group_backups(self, backups):
@@ -315,6 +530,7 @@ class RotateBackups(object):
         """
         backups_by_frequency = dict((frequency, collections.defaultdict(list)) for frequency in SUPPORTED_FREQUENCIES)
         for b in backups:
+            backups_by_frequency['minutely'][(b.year, b.month, b.day, b.hour, b.minute)].append(b)
             backups_by_frequency['hourly'][(b.year, b.month, b.day, b.hour)].append(b)
             backups_by_frequency['daily'][(b.year, b.month, b.day)].append(b)
             backups_by_frequency['weekly'][(b.year, b.week)].append(b)
@@ -345,23 +561,26 @@ class RotateBackups(object):
             if frequency not in self.rotation_scheme:
                 backups.clear()
             else:
-                # Reduce the number of backups in each period of this rotation
-                # frequency to a single backup (the first in the period).
+                # Reduce the number of backups in each time slot of this
+                # rotation frequency to a single backup (the oldest one or the
+                # newest one).
                 for period, backups_in_period in backups.items():
-                    first_backup = sorted(backups_in_period)[0]
-                    backups[period] = [first_backup]
+                    index = -1 if self.prefer_recent else 0
+                    selected_backup = sorted(backups_in_period)[index]
+                    backups[period] = [selected_backup]
                 # Check if we need to rotate away backups in old periods.
                 retention_period = self.rotation_scheme[frequency]
                 if retention_period != 'always':
                     # Remove backups created before the minimum date of this
-                    # rotation frequency (relative to the most recent backup).
-                    minimum_date = most_recent_backup - SUPPORTED_FREQUENCIES[frequency] * retention_period
-                    for period, backups_in_period in list(backups.items()):
-                        for backup in backups_in_period:
-                            if backup.datetime < minimum_date:
-                                backups_in_period.remove(backup)
-                        if not backups_in_period:
-                            backups.pop(period)
+                    # rotation frequency? (relative to the most recent backup)
+                    if self.strict:
+                        minimum_date = most_recent_backup - SUPPORTED_FREQUENCIES[frequency] * retention_period
+                        for period, backups_in_period in list(backups.items()):
+                            for backup in backups_in_period:
+                                if backup.timestamp < minimum_date:
+                                    backups_in_period.remove(backup)
+                            if not backups_in_period:
+                                backups.pop(period)
                     # If there are more periods remaining than the user
                     # requested to be preserved we delete the oldest one(s).
                     items_to_preserve = sorted(backups.items())[-retention_period:]
@@ -386,60 +605,127 @@ class RotateBackups(object):
         return backups_to_preserve
 
 
-@functools.total_ordering
-class Backup(object):
+class Location(PropertyManager):
 
-    """
-    :py:class:`Backup` objects represent a rotation subject.
+    """:class:`Location` objects represent a root directory containing backups."""
 
-    In addition to the :attr:`type` and :attr:`week` properties :class:`Backup`
-    objects support all of the attributes of :py:class:`~datetime.datetime`
-    objects by deferring attribute access for unknown attributes to the
-    :py:class:`~datetime.datetime` object given to the constructor.
-    """
+    @required_property
+    def context(self):
+        """An execution context created using :mod:`executor.contexts`."""
 
-    def __init__(self, pathname, datetime):
-        """
-        Initialize a :py:class:`Backup` object.
+    @required_property
+    def directory(self):
+        """The pathname of a directory containing backups (a string)."""
 
-        :param pathname: The filename of the backup (a string).
-        :param datetime: The date/time when the backup was created (a
-                         :py:class:`~datetime.datetime` object).
-        """
-        self.pathname = pathname
-        self.datetime = datetime
+    @lazy_property
+    def mount_point(self):
+        """The pathname of the mount point of :attr:`directory` (a string)."""
+        return self.context.capture('stat', '--format=%m', self.directory)
+
+    @lazy_property
+    def is_remote(self):
+        """:data:`True` if the location is remote, :data:`False` otherwise."""
+        return isinstance(self.context, RemoteContext)
+
+    @lazy_property
+    def ssh_alias(self):
+        """The SSH alias of a remote location (a string or :data:`None`)."""
+        return self.context.ssh_alias if self.is_remote else None
 
     @property
-    def type(self):
-        """Get a string describing the type of backup (e.g. file, directory)."""
-        if os.path.islink(self.pathname):
-            return 'symbolic link'
-        elif os.path.isdir(self.pathname):
-            return 'directory'
-        else:
-            return 'file'
+    def key_properties(self):
+        """
+        A list of strings with the names of the :attr:`~custom_property.key` properties.
+
+        Overrides :attr:`~property_manager.PropertyManager.key_properties` to
+        customize the ordering of :class:`Location` objects so that they are
+        ordered first by their :attr:`ssh_alias` and second by their
+        :attr:`directory`.
+        """
+        return ['ssh_alias', 'directory'] if self.is_remote else ['directory']
+
+    def ensure_exists(self):
+        """Make sure the location exists."""
+        if not self.context.is_directory(self.directory):
+            # This can also happen when we don't have permission to one of the
+            # parent directories so we'll point that out in the error message
+            # when it seems applicable (so as not to confuse users).
+            if self.context.have_superuser_privileges:
+                msg = "The directory %s doesn't exist!"
+                raise ValueError(msg % self)
+            else:
+                raise ValueError(compact("""
+                    The directory {location} isn't accessible, most likely
+                    because it doesn't exist or because of permissions. If
+                    you're sure the directory exists you can use the
+                    --use-sudo option.
+                """, location=self))
+
+    def ensure_readable(self):
+        """Make sure the location exists and is readable."""
+        self.ensure_exists()
+        if not self.context.is_readable(self.directory):
+            if self.context.have_superuser_privileges:
+                msg = "The directory %s isn't readable!"
+                raise ValueError(msg % self)
+            else:
+                raise ValueError(compact("""
+                    The directory {location} isn't readable, most likely
+                    because of permissions. Consider using the --use-sudo
+                    option.
+                """, location=self))
+
+    def ensure_writable(self):
+        """Make sure the directory exists and is writable."""
+        self.ensure_exists()
+        if not self.context.is_writable(self.directory):
+            if self.context.have_superuser_privileges:
+                msg = "The directory %s isn't writable!"
+                raise ValueError(msg % self)
+            else:
+                raise ValueError(compact("""
+                    The directory {location} isn't writable, most likely due
+                    to permissions. Consider using the --use-sudo option.
+                """, location=self))
+
+    def __str__(self):
+        """Render a simple human readable representation of a location."""
+        return '%s:%s' % (self.ssh_alias, self.directory) if self.ssh_alias else self.directory
+
+
+class Backup(PropertyManager):
+
+    """
+    :class:`Backup` objects represent a rotation subject.
+
+    In addition to the :attr:`pathname`, :attr:`timestamp` and :attr:`week`
+    properties :class:`Backup` objects support all of the attributes of
+    :class:`~datetime.datetime` objects by deferring attribute access for
+    unknown attributes to :attr:`timestamp`.
+    """
+
+    key_properties = 'timestamp', 'pathname'
+    """
+    Customize the ordering of :class:`Backup` objects.
+
+    :class:`Backup` objects are ordered first by their :attr:`timestamp` and
+    second by their :attr:`pathname`. This class variable overrides
+    :attr:`~property_manager.PropertyManager.key_properties`.
+    """
+
+    @key_property
+    def pathname(self):
+        """The pathname of the backup (a string)."""
+
+    @key_property
+    def timestamp(self):
+        """The date and time when the backup was created (a :class:`~datetime.datetime` object)."""
 
     @property
     def week(self):
-        """Get the ISO week number."""
-        return self.datetime.isocalendar()[1]
+        """The ISO week number of :attr:`timestamp` (a number)."""
+        return self.timestamp.isocalendar()[1]
 
     def __getattr__(self, name):
-        """Defer attribute access to the datetime object."""
-        return getattr(self.datetime, name)
-
-    def __repr__(self):
-        """Enable pretty printing of :py:class:`Backup` objects."""
-        return "Backup(pathname=%r, datetime=%r)" % (self.pathname, self.datetime)
-
-    def __hash__(self):
-        """Make it possible to use :py:class:`Backup` objects in sets and as dictionary keys."""
-        return hash(self.pathname)
-
-    def __eq__(self, other):
-        """Make it possible to use :py:class:`Backup` objects in sets and as dictionary keys."""
-        return type(self) == type(other) and self.datetime == other.datetime
-
-    def __lt__(self, other):
-        """Enable proper sorting of backups."""
-        return self.datetime < other.datetime
+        """Defer attribute access to :attr:`timestamp`."""
+        return getattr(self.timestamp, name)

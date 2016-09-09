@@ -1,8 +1,10 @@
 # Test suite for the `rotate-backups' Python package.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: August 30, 2015
+# Last Change: August 5, 2016
 # URL: https://github.com/xolox/python-rotate-backups
+
+"""Test suite for the `rotate-backups` package."""
 
 # Standard library modules.
 import logging
@@ -14,10 +16,16 @@ import unittest
 
 # External dependencies.
 import coloredlogs
+from executor.contexts import RemoteContext
 from six.moves import configparser
 
 # The module we're testing.
-from rotate_backups import load_config_file, RotateBackups
+from rotate_backups import (
+    RotateBackups,
+    coerce_location,
+    coerce_retention_period,
+    load_config_file,
+)
 from rotate_backups.cli import main
 
 # Initialize a logger for this module.
@@ -83,9 +91,34 @@ SAMPLE_BACKUP_SET = set([
 
 class RotateBackupsTestCase(unittest.TestCase):
 
+    """:mod:`unittest` compatible container for `rotate-backups` tests."""
+
     def setUp(self):
         """Enable verbose logging for the test suite."""
         coloredlogs.install(level=logging.DEBUG)
+
+    def test_retention_period_coercion(self):
+        """Test coercion of retention period expressions."""
+        # Test that invalid values are refused.
+        self.assertRaises(ValueError, coerce_retention_period, ['not', 'a', 'string'])
+        # Test that invalid evaluation results are refused.
+        self.assertRaises(ValueError, coerce_retention_period, 'None')
+        # Check that the string `always' makes it through alive :-).
+        assert coerce_retention_period('always') == 'always'
+        assert coerce_retention_period('Always') == 'always'
+        # Check that anything else properly evaluates to a number.
+        assert coerce_retention_period(42) == 42
+        assert coerce_retention_period('42') == 42
+        assert coerce_retention_period('21 * 2') == 42
+
+    def test_location_coercion(self):
+        """Test coercion of locations."""
+        # Test that invalid values are refused.
+        self.assertRaises(ValueError, lambda: coerce_location(['not', 'a', 'string']))
+        # Test that remote locations are properly parsed.
+        location = coerce_location('some-host:/some/directory')
+        assert isinstance(location.context, RemoteContext)
+        assert location.directory == '/some/directory'
 
     def test_argument_validation(self):
         """Test argument validation."""
@@ -96,13 +129,19 @@ class RotateBackupsTestCase(unittest.TestCase):
         # Argument validation tests that require an empty directory.
         with TemporaryDirectory(prefix='rotate-backups-', suffix='-test-suite') as root:
             # Test that non-existing directories cause an error to be reported.
-            assert run_cli(os.path.join(root, 'does-not-exist')) != 0
+            self.assertRaises(ValueError, lambda: run_cli(os.path.join(root, 'does-not-exist')))
             # Test that loading of a custom configuration file raises an
             # exception when the configuration file cannot be loaded.
             self.assertRaises(ValueError, lambda: list(load_config_file(os.path.join(root, 'rotate-backups.ini'))))
             # Test that an empty rotation scheme raises an exception.
             self.create_sample_backup_set(root)
             self.assertRaises(ValueError, lambda: RotateBackups(rotation_scheme={}).rotate_backups(root))
+        # Argument validation tests that assume the current user isn't root.
+        if os.getuid() != 0:
+            # I'm being lazy and will assume that this test suite will only be
+            # run on systems where users other than root do not have access to
+            # /root.
+            self.assertRaises(ValueError, lambda: run_cli('-n', '/root'))
 
     def test_dry_run(self):
         """Make sure dry run doesn't remove any backups."""
@@ -159,6 +198,41 @@ class RotateBackupsTestCase(unittest.TestCase):
                 parser.write(handle)
             self.create_sample_backup_set(root)
             run_cli('--verbose', '--config=%s' % config_file)
+            backups_that_were_preserved = set(os.listdir(root))
+            assert backups_that_were_preserved == expected_to_be_preserved
+
+    def test_rotate_concurrent(self):
+        """Test the :func:`.rotate_concurrent()` function."""
+        # These are the backups expected to be preserved
+        # (the same as in test_rotate_backups).
+        expected_to_be_preserved = set([
+            '2013-10-10@20:07',  # monthly, yearly (1)
+            '2013-11-01@20:06',  # monthly (2)
+            '2013-12-01@20:07',  # monthly (3)
+            '2014-01-01@20:07',  # monthly (4), yearly (2)
+            '2014-02-01@20:05',  # monthly (5)
+            '2014-03-01@20:04',  # monthly (6)
+            '2014-04-01@20:03',  # monthly (7)
+            '2014-05-01@20:06',  # monthly (8)
+            '2014-06-01@20:01',  # monthly (9)
+            '2014-06-09@20:01',  # weekly (1)
+            '2014-06-16@20:02',  # weekly (2)
+            '2014-06-23@20:04',  # weekly (3)
+            '2014-06-26@20:04',  # daily (1)
+            '2014-06-27@20:02',  # daily (2)
+            '2014-06-28@20:02',  # daily (3)
+            '2014-06-29@20:01',  # daily (4)
+            '2014-06-30@20:03',  # daily (5), weekly (4)
+            '2014-07-01@20:02',  # daily (6), monthly (10)
+            '2014-07-02@20:03',  # hourly (1), daily (7)
+            'some-random-directory',  # no recognizable time stamp, should definitely be preserved
+        ])
+        with TemporaryDirectory(prefix='rotate-backups-', suffix='-test-suite') as root:
+            self.create_sample_backup_set(root)
+            run_cli(
+                '--verbose', '--hourly=24', '--daily=7', '--weekly=4',
+                '--monthly=12', '--yearly=always', '--parallel', root,
+            )
             backups_that_were_preserved = set(os.listdir(root))
             assert backups_that_were_preserved == expected_to_be_preserved
 
@@ -242,6 +316,61 @@ class RotateBackupsTestCase(unittest.TestCase):
             backups_that_were_preserved = set(os.listdir(root))
             assert backups_that_were_preserved == expected_to_be_preserved
 
+    def test_strict_rotation(self):
+        """Test strict rotation."""
+        with TemporaryDirectory(prefix='rotate-backups-', suffix='-test-suite') as root:
+            os.mkdir(os.path.join(root, 'galera_backup_db4.sl.example.lab_2016-03-17_10-00'))
+            os.mkdir(os.path.join(root, 'galera_backup_db4.sl.example.lab_2016-03-17_12-00'))
+            os.mkdir(os.path.join(root, 'galera_backup_db4.sl.example.lab_2016-03-17_16-00'))
+            run_cli('--hourly=3', '--daily=1', root)
+            assert os.path.exists(os.path.join(root, 'galera_backup_db4.sl.example.lab_2016-03-17_10-00'))
+            assert os.path.exists(os.path.join(root, 'galera_backup_db4.sl.example.lab_2016-03-17_12-00')) is False
+            assert os.path.exists(os.path.join(root, 'galera_backup_db4.sl.example.lab_2016-03-17_16-00'))
+
+    def test_relaxed_rotation(self):
+        """Test relaxed rotation."""
+        with TemporaryDirectory(prefix='rotate-backups-', suffix='-test-suite') as root:
+            os.mkdir(os.path.join(root, 'galera_backup_db4.sl.example.lab_2016-03-17_10-00'))
+            os.mkdir(os.path.join(root, 'galera_backup_db4.sl.example.lab_2016-03-17_12-00'))
+            os.mkdir(os.path.join(root, 'galera_backup_db4.sl.example.lab_2016-03-17_16-00'))
+            run_cli('--hourly=3', '--daily=1', '--relaxed', root)
+            assert os.path.exists(os.path.join(root, 'galera_backup_db4.sl.example.lab_2016-03-17_10-00'))
+            assert os.path.exists(os.path.join(root, 'galera_backup_db4.sl.example.lab_2016-03-17_12-00'))
+            assert os.path.exists(os.path.join(root, 'galera_backup_db4.sl.example.lab_2016-03-17_16-00'))
+
+    def test_prefer_old(self):
+        """Test the default preference for the oldest backup in each time slot."""
+        with TemporaryDirectory(prefix='rotate-backups-', suffix='-test-suite') as root:
+            os.mkdir(os.path.join(root, 'backup-2016-01-10_21-15-00'))
+            os.mkdir(os.path.join(root, 'backup-2016-01-10_21-30-00'))
+            os.mkdir(os.path.join(root, 'backup-2016-01-10_21-45-00'))
+            run_cli('--hourly=1', root)
+            assert os.path.exists(os.path.join(root, 'backup-2016-01-10_21-15-00'))
+            assert not os.path.exists(os.path.join(root, 'backup-2016-01-10_21-30-00'))
+            assert not os.path.exists(os.path.join(root, 'backup-2016-01-10_21-45-00'))
+
+    def test_prefer_new(self):
+        """Test the alternative preference for the newest backup in each time slot."""
+        with TemporaryDirectory(prefix='rotate-backups-', suffix='-test-suite') as root:
+            os.mkdir(os.path.join(root, 'backup-2016-01-10_21-15-00'))
+            os.mkdir(os.path.join(root, 'backup-2016-01-10_21-30-00'))
+            os.mkdir(os.path.join(root, 'backup-2016-01-10_21-45-00'))
+            run_cli('--hourly=1', '--prefer-recent', root)
+            assert not os.path.exists(os.path.join(root, 'backup-2016-01-10_21-15-00'))
+            assert not os.path.exists(os.path.join(root, 'backup-2016-01-10_21-30-00'))
+            assert os.path.exists(os.path.join(root, 'backup-2016-01-10_21-45-00'))
+
+    def test_minutely_rotation(self):
+        """Test rotation with multiple backups per hour."""
+        with TemporaryDirectory(prefix='rotate-backups-', suffix='-test-suite') as root:
+            os.mkdir(os.path.join(root, 'backup-2016-01-10_21-15-00'))
+            os.mkdir(os.path.join(root, 'backup-2016-01-10_21-30-00'))
+            os.mkdir(os.path.join(root, 'backup-2016-01-10_21-45-00'))
+            run_cli('--prefer-recent', '--relaxed', '--minutely=2', root)
+            assert not os.path.exists(os.path.join(root, 'backup-2016-01-10_21-15-00'))
+            assert os.path.exists(os.path.join(root, 'backup-2016-01-10_21-30-00'))
+            assert os.path.exists(os.path.join(root, 'backup-2016-01-10_21-45-00'))
+
     def create_sample_backup_set(self, root):
         """Create a sample backup set to be rotated."""
         for name in SAMPLE_BACKUP_SET:
@@ -249,6 +378,7 @@ class RotateBackupsTestCase(unittest.TestCase):
 
 
 def run_cli(*arguments):
+    """Simple wrapper to run :func:`rotate_backups.cli.main()` in the same process."""
     # Temporarily replace sys.argv.
     saved_arguments = sys.argv
     sys.argv = ['rotate-backups'] + list(arguments)
@@ -282,22 +412,18 @@ class TemporaryDirectory(object):
         Initialize context manager that manages creation & cleanup of temporary directory.
 
         :param options: Any keyword arguments are passed on to
-                        :py:func:`tempfile.mkdtemp()`.
+                        :func:`tempfile.mkdtemp()`.
         """
         self.options = options
 
     def __enter__(self):
-        """
-        Create the temporary directory.
-        """
+        """Create the temporary directory."""
         self.temporary_directory = tempfile.mkdtemp(**self.options)
         logger.debug("Created temporary directory: %s", self.temporary_directory)
         return self.temporary_directory
 
     def __exit__(self, exc_type, exc_value, traceback):
-        """
-        Destroy the temporary directory.
-        """
+        """Destroy the temporary directory."""
         logger.debug("Cleaning up temporary directory: %s", self.temporary_directory)
         shutil.rmtree(self.temporary_directory)
         del self.temporary_directory

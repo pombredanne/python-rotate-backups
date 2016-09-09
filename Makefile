@@ -1,12 +1,14 @@
-# Makefile for rotate-backups
+# Makefile for rotate-backups.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: July 19, 2015
+# Last Change: July 13, 2016
 # URL: https://github.com/xolox/python-rotate-backups
 
 WORKON_HOME ?= $(HOME)/.virtualenvs
 VIRTUAL_ENV ?= $(WORKON_HOME)/rotate-backups
-ACTIVATE = . $(VIRTUAL_ENV)/bin/activate
+PATH := $(VIRTUAL_ENV)/bin:$(PATH)
+MAKE := $(MAKE) --no-print-directory
+SHELL = bash
 
 default:
 	@echo 'Makefile for rotate-backups'
@@ -15,52 +17,63 @@ default:
 	@echo
 	@echo '    make install    install the package in a virtual environment'
 	@echo '    make reset      recreate the virtual environment'
-	@echo '    make test       run the test suite'
-	@echo '    make coverage   run the tests, report coverage'
+	@echo '    make check      check coding style (PEP-8, PEP-257)'
+	@echo '    make test       run the test suite, report coverage'
+	@echo '    make tox        run the tests on all Python versions'
+	@echo '    make readme     update usage in readme'
 	@echo '    make docs       update documentation using Sphinx'
 	@echo '    make publish    publish changes to GitHub/PyPI'
 	@echo '    make clean      cleanup all temporary files'
 	@echo
 
 install:
-	test -d "$(VIRTUAL_ENV)" || virtualenv "$(VIRTUAL_ENV)"
-	test -x "$(VIRTUAL_ENV)/bin/pip" || ($(ACTIVATE) && easy_install pip)
-	test -x "$(VIRTUAL_ENV)/bin/pip-accel" || ($(ACTIVATE) && pip install pip-accel)
-	$(ACTIVATE) && pip uninstall -y rotate-backups >/dev/null 2>&1 || true
-	$(ACTIVATE) && pip install --quiet --editable .
+	@test -d "$(VIRTUAL_ENV)" || mkdir -p "$(VIRTUAL_ENV)"
+	@test -x "$(VIRTUAL_ENV)/bin/python" || virtualenv --quiet "$(VIRTUAL_ENV)"
+	@test -x "$(VIRTUAL_ENV)/bin/pip" || easy_install pip
+	@test -x "$(VIRTUAL_ENV)/bin/pip-accel" || (pip install --quiet pip-accel && pip-accel install --quiet 'urllib3[secure]')
+	@echo "Updating requirements .." >&2
+	@pip-accel install --quiet --requirement=requirements.txt
+	@if ! which rotate-backups &>/dev/null; then  \
+		echo "Installing rotate-backups .." >&2;      \
+		pip install --quiet --no-deps --editable .; \
+	fi
 
 reset:
+	$(MAKE) clean
 	rm -Rf "$(VIRTUAL_ENV)"
-	make --no-print-directory clean install
+	$(MAKE) install
+
+check: install
+	@echo "Updating flake8 .." >&2
+	@pip-accel install --upgrade --quiet --requirement=requirements-checks.txt
+	@flake8
 
 test: install
-	test -x "$(VIRTUAL_ENV)/bin/py.test" || ($(ACTIVATE) && pip-accel install pytest)
-	$(ACTIVATE) && py.test -v
-	$(ACTIVATE) && make coverage
-	test -x "$(VIRTUAL_ENV)/bin/tox" || ($(ACTIVATE) && pip-accel install tox)
-	$(ACTIVATE) && tox
+	@pip-accel install --quiet coverage pytest pytest-cov
+	@py.test -v --cov --cov-report=html --no-cov-on-fail
+	@coverage report --fail-under=90
 
-coverage: install
-	$(ACTIVATE) && pip-accel install coverage
-	$(ACTIVATE) && coverage run setup.py test
-	$(ACTIVATE) && coverage report
-	$(ACTIVATE) && coverage html
+tox: install
+	@pip-accel install --quiet tox && tox
 
-readme:
-	test -x "$(VIRTUAL_ENV)/bin/cog.py" || ($(ACTIVATE) && pip-accel install cogapp)
-	$(ACTIVATE) && cog.py -r README.rst
+readme: install
+	@pip-accel install --quiet cogapp && cog.py -r README.rst
 
-docs: install
-	test -x "$(VIRTUAL_ENV)/bin/sphinx-build" || ($(ACTIVATE) && pip-accel install sphinx)
-	$(ACTIVATE) && cd docs && sphinx-build -b html -d build/doctrees . build/html
+docs: readme
+	@pip-accel install --quiet sphinx
+	@cd docs && sphinx-build -nb html -d build/doctrees . build/html
 
-publish:
+publish: install
 	git push origin && git push --tags origin
-	make clean && python setup.py sdist upload
+	$(MAKE) clean
+	pip-accel install --quiet twine wheel
+	python setup.py sdist bdist_wheel
+	twine upload dist/*
+	$(MAKE) clean
 
 clean:
-	rm -Rf *.egg *.egg-info .coverage build dist docs/build htmlcov
-	find -depth -type d -name __pycache__ -exec rm -Rf {} \;
-	find -type f -name '*.pyc' -delete
+	@rm -Rf *.egg .cache .coverage .tox build dist docs/build htmlcov
+	@find -depth -type d -name __pycache__ -exec rm -Rf {} \;
+	@find -type f -name '*.pyc' -delete
 
-.PHONY: default install reset test coverage docs publish clean
+.PHONY: default install reset check test tox readme docs publish clean

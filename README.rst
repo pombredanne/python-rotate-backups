@@ -30,7 +30,8 @@ copy/pasting these scripts around I decided to bring the main features together
 in a properly documented Python package and upload it to the `Python Package
 Index`_.
 
-The `rotate-backups` package is currently tested on Python 2.7, 3.4 and PyPy.
+The `rotate-backups` package is currently tested on cPython 2.6, 2.7, 3.4, 3.5
+and PyPy (2.7).
 
 .. contents::
    :local:
@@ -100,9 +101,13 @@ Command line
 .. inject_usage('rotate_backups.cli')
 .. ]]]
 
-**Usage:** `rotate-backups [OPTIONS] DIRECTORY..`
+**Usage:** `rotate-backups [OPTIONS] [DIRECTORY, ..]`
 
-Easy rotation of backups based on the Python package by the same name. To use this program you specify a rotation scheme via (a combination of) the ``--hourly``, ``--daily``, ``--weekly``, ``--monthly`` and/or ``--yearly`` options and specify the directory (or multiple directories) containing backups to rotate as one or more positional arguments.
+Easy rotation of backups based on the Python package by the same name.
+
+To use this program you specify a rotation scheme via (a combination of) the ``--hourly``, ``--daily``, ``--weekly``, ``--monthly`` and/or ``--yearly`` options and the directory (or directories) containing backups to rotate as one or more positional arguments.
+
+You can rotate backups on a remote system over SSH by prefixing a DIRECTORY with an SSH alias and separating the two with a colon (similar to how rsync accepts remote locations).
 
 Instead of specifying directories and a rotation scheme on the command line you can also add them to a configuration file. For more details refer to the online documentation (see also the ``--config`` option).
 
@@ -115,49 +120,81 @@ Please use the ``--dry-run`` option to test the effect of the specified rotation
    :widths: 30, 70
 
 
+   "``-M``, ``--minutely=COUNT``","In a literal sense this option sets the number of ""backups per minute"" to
+   preserve during rotation. For most use cases that doesn't make a lot of
+   sense :-) but you can combine the ``--minutely`` and ``--relaxed`` options to
+   preserve more than one backup per hour.  Refer to the usage of the ``-H``,
+   ``--hourly`` option for details about ``COUNT``."
    "``-H``, ``--hourly=COUNT``","Set the number of hourly backups to preserve during rotation:
    
-   - If ``COUNT`` is an integer it gives the number of hourly backups to preserve,
+   - If ``COUNT`` is a number it gives the number of hourly backups to preserve,
      starting from the most recent hourly backup and counting back in time.
+   - Alternatively you can provide an expression that will be evaluated to get
+     a number (e.g. if ``COUNT`` is ""7 \* 2"" the result would be 14).
    - You can also pass ""always"" for ``COUNT``, in this case all hourly backups are
      preserved.
-   - By default no hourly backups are preserved.
-   "
+   - By default no hourly backups are preserved."
    "``-d``, ``--daily=COUNT``","Set the number of daily backups to preserve during rotation. Refer to the
-   usage of the ``-H``, ``--hourly`` option for details.
-   "
+   usage of the ``-H``, ``--hourly`` option for details about ``COUNT``."
    "``-w``, ``--weekly=COUNT``","Set the number of weekly backups to preserve during rotation. Refer to the
-   usage of the ``-H``, ``--hourly`` option for details.
-   "
+   usage of the ``-H``, ``--hourly`` option for details about ``COUNT``."
    "``-m``, ``--monthly=COUNT``","Set the number of monthly backups to preserve during rotation. Refer to the
-   usage of the ``-H``, ``--hourly`` option for details.
-   "
+   usage of the ``-H``, ``--hourly`` option for details about ``COUNT``."
    "``-y``, ``--yearly=COUNT``","Set the number of yearly backups to preserve during rotation. Refer to the
-   usage of the ``-H``, ``--hourly`` option for details.
-   "
+   usage of the ``-H``, ``--hourly`` option for details about ``COUNT``."
    "``-I``, ``--include=PATTERN``","Only process backups that match the shell pattern given by ``PATTERN``. This
    argument can be repeated. Make sure to quote ``PATTERN`` so the shell doesn't
-   expand the pattern before it's received by rotate-backups.
-   "
+   expand the pattern before it's received by rotate-backups."
    "``-x``, ``--exclude=PATTERN``","Don't process backups that match the shell pattern given by ``PATTERN``. This
    argument can be repeated. Make sure to quote ``PATTERN`` so the shell doesn't
-   expand the pattern before it's received by rotate-backups.
-   "
+   expand the pattern before it's received by rotate-backups."
+   "``-j``, ``--parallel``","Remove backups in parallel, one backup per mount point at a time. The idea
+   behind this approach is that parallel rotation is most useful when the
+   files to be removed are on different disks and so multiple devices can be
+   utilized at the same time.
+   
+   Because mount points are per system the ``-j``, ``--parallel`` option will also
+   parallelize over backups located on multiple remote systems."
+   "``-p``, ``--prefer-recent``","By default the first (oldest) backup in each time slot is preserved. If
+   you'd prefer to keep the most recent backup in each time slot instead then
+   this option is for you."
+   "``-r``, ``--relaxed``","By default the time window for each rotation scheme is enforced (this is
+   referred to as strict rotation) but the ``-r``, ``--relaxed`` option can be used
+   to alter this behavior. The easiest way to explain the difference between
+   strict and relaxed rotation is using an example:
+   
+   - When using strict rotation and the number of hourly backups to preserve
+     is three, only backups created in the relevant time window (the hour of
+     the most recent backup and the two hours leading up to that) will match
+     the hourly frequency.
+   
+   - When using relaxed rotation the three most recent backups will all match
+     the hourly frequency (and thus be preserved), regardless of the
+     calculated time window.
+   
+   If the explanation above is not clear enough, here's a simple way to decide
+   whether you want to customize this behavior or not:
+   
+   - If your backups are created at regular intervals and you never miss an
+     interval then strict rotation (the default) is probably the best choice.
+   
+   - If your backups are created at irregular intervals then you may want to
+     use the ``-r``, ``--relaxed`` option in order to preserve more backups."
    "``-i``, ``--ionice=CLASS``","Use the ""ionice"" program to set the I/O scheduling class and priority of
    the ""rm"" invocations used to remove backups. ``CLASS`` is expected to be one of
    the values ""idle"", ""best-effort"" or ""realtime"". Refer to the man page of
-   the ""ionice"" program for details about these values.
-   "
+   the ""ionice"" program for details about these values."
    "``-c``, ``--config=PATH``","Load configuration from the pathname given by ``PATH``. If this option isn't
    given two default locations are checked: ""~/.rotate-backups.ini"" and
    ""/etc/rotate-backups.ini"". The first of these two configuration files to
-   exist is loaded. For more details refer to the online documentation.
-   "
+   exist is loaded. For more details refer to the online documentation."
+   "``-u``, ``--use-sudo``","Enable the use of ""sudo"" to rotate backups in directories that are not
+   readable and/or writable for the current user (or the user logged in to a
+   remote system over SSH)."
    "``-n``, ``--dry-run``","Don't make any changes, just print what would be done. This makes it easy
-   to evaluate the impact of a rotation scheme without losing any backups.
-   "
-   "``-v``, ``--verbose``","Make more noise (increase logging verbosity).
-   "
+   to evaluate the impact of a rotation scheme without losing any backups."
+   "``-v``, ``--verbose``",Make more noise (increase logging verbosity). Can be repeated.
+   "``-q``, ``--quiet``",Make less noise (decrease logging verbosity). Can be repeated.
    "``-h``, ``--help``","Show this message and exit.
    "
 
@@ -196,9 +233,9 @@ make regular backups of:
    ionice = idle
 
    [/backups/server]
-   daily = 7
-   weekly = 4
-   monthly = 12
+   daily = 7 * 2
+   weekly = 4 * 2
+   monthly = 12 * 4
    yearly = always
    ionice = idle
 
@@ -214,6 +251,59 @@ make regular backups of:
    monthly = 2
    ionice = idle
 
+As you can see in the retention periods of the directory ``/backups/server`` in
+the example above you are allowed to use expressions that evaluate to a number
+(instead of having to write out the literal number).
+
+Here's an example of a configuration for two remote directories:
+
+.. code-block:: ini
+
+   # SSH as a regular user and use `sudo' to elevate privileges.
+   [server:/backups/laptop]
+   use-sudo = yes
+   hourly = 24
+   daily = 7
+   weekly = 4
+   monthly = 12
+   yearly = always
+   ionice = idle
+
+   # SSH as the root user (avoids sudo passwords).
+   [server:/backups/server]
+   ssh-user = root
+   hourly = 24
+   daily = 7
+   weekly = 4
+   monthly = 12
+   yearly = always
+   ionice = idle
+
+As this example shows you have the option to connect as the root user or to
+connect as a regular user and use ``sudo`` to elevate privileges.
+
+Customizing the rotation algorithm
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Since publishing `rotate-backups` I've found that the default rotation
+algorithm is not to everyone's satisfaction and because the suggested
+alternatives were just as valid as the choices that I initially made,
+options were added to expose the alternative behaviors:
+
++-------------------------------------+-------------------------------------+
+| Default                             | Alternative                         |
++=====================================+=====================================+
+| Strict rotation (the time window    | Relaxed rotation (time windows are  |
+| for each rotation frequency is      | not enforced). Enabled by the       |
+| enforced).                          | ``-r``, ``--relaxed`` option.       |
++-------------------------------------+-------------------------------------+
+| The oldest backup in each time slot | The newest backup in each time slot |
+| is preserved and newer backups in   | is preserved and older backups in   |
+| the time slot are removed.          | the time slot are removed. Enabled  |
+|                                     | by the ``-p``, ``--prefer-recent``  |
+|                                     | option.                             |
++-------------------------------------+-------------------------------------+
+
 Contact
 -------
 
@@ -227,7 +317,7 @@ License
 
 This software is licensed under the `MIT license`_.
 
-© 2015 Peter Odding.
+© 2016 Peter Odding.
 
 .. External references:
 

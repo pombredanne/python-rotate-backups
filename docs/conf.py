@@ -1,18 +1,30 @@
-# -*- coding: utf-8 -*-
-#
-# documentation build configuration file for the 'rotate-backups' package. This
-# file is execfile()d with the current directory set to its containing dir.
+"""
+Documentation build configuration file for the `rotate-backups` package.
+
+This Python script contains the Sphinx configuration for building the
+documentation of the `rotate-backups` project. This file is execfile()d
+with the current directory set to its containing dir.
+"""
 
 import os
 import sys
 
 # Add the 'rotate-backups' source distribution's root directory to the module path.
-sys.path.insert(0, os.path.abspath('..'))
+sys.path.insert(0, os.path.abspath(os.pardir))
 
 # -- General configuration -----------------------------------------------------
 
 # Sphinx extension module names.
-extensions = ['sphinx.ext.doctest', 'sphinx.ext.autodoc', 'sphinx.ext.intersphinx']
+extensions = [
+    'sphinx.ext.autodoc',
+    'sphinx.ext.doctest',
+    'sphinx.ext.intersphinx',
+    'sphinx.ext.viewcode',
+    'humanfriendly.sphinx',
+]
+
+# Configuration for the `autodoc' extension.
+autodoc_member_order = 'bysource'
 
 # Paths that contain templates, relative to this directory.
 templates_path = ['templates']
@@ -25,14 +37,14 @@ master_doc = 'index'
 
 # General information about the project.
 project = u'rotate-backups'
-copyright = u'2015, Peter Odding'
+copyright = u'2016, Peter Odding'
 
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
 # built documents.
 
 # Find the package version and make it the release.
-from rotate_backups import __version__ as rotate_backups_version
+from rotate_backups import __version__ as rotate_backups_version  # noqa
 
 # The short X.Y version.
 version = '.'.join(rotate_backups_version.split('.')[:2])
@@ -58,20 +70,16 @@ pygments_style = 'sphinx'
 # From: http://twistedmatrix.com/trac/ticket/4582.
 intersphinx_mapping = {
     'python': ('http://docs.python.org', None),
-    'dateutil': ('https://dateutil.readthedocs.org/en/latest/', None),
+    'dateutil': ('https://dateutil.readthedocs.io/en/latest/', None),
+    'executor': ('https://executor.readthedocs.io/en/latest/', None),
+    'propertymanager': ('https://property-manager.readthedocs.io/en/latest/', None),
 }
 
 # -- Options for HTML output ---------------------------------------------------
 
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
-html_theme = 'default'
+html_theme = 'classic'
 
 # Output file base name for HTML help builder.
 htmlhelp_basename = 'rotatebackupsdoc'
-
-
-def setup(app):
-    # Based on http://stackoverflow.com/a/5599712/788200.
-    app.connect('autodoc-skip-member', (lambda app, what, name, obj, skip, options:
-                                        False if name == '__init__' and obj.__doc__ else skip))

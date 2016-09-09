@@ -1,17 +1,22 @@
 # rotate-backups: Simple command line interface for backup rotation.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: July 19, 2015
+# Last Change: August 5, 2016
 # URL: https://github.com/xolox/python-rotate-backups
 
 """
-Usage: rotate-backups [OPTIONS] DIRECTORY..
+Usage: rotate-backups [OPTIONS] [DIRECTORY, ..]
 
-Easy rotation of backups based on the Python package by the same name. To use
-this program you specify a rotation scheme via (a combination of) the --hourly,
---daily, --weekly, --monthly and/or --yearly options and specify the directory
-(or multiple directories) containing backups to rotate as one or more
+Easy rotation of backups based on the Python package by the same name.
+
+To use this program you specify a rotation scheme via (a combination of) the
+--hourly, --daily, --weekly, --monthly and/or --yearly options and the
+directory (or directories) containing backups to rotate as one or more
 positional arguments.
+
+You can rotate backups on a remote system over SSH by prefixing a DIRECTORY
+with an SSH alias and separating the two with a colon (similar to how rsync
+accepts remote locations).
 
 Instead of specifying directories and a rotation scheme on the command line you
 can also add them to a configuration file. For more details refer to the online
@@ -24,12 +29,22 @@ intended you have no right to complain ;-).
 
 Supported options:
 
+  -M, --minutely=COUNT
+
+    In a literal sense this option sets the number of "backups per minute" to
+    preserve during rotation. For most use cases that doesn't make a lot of
+    sense :-) but you can combine the --minutely and --relaxed options to
+    preserve more than one backup per hour.  Refer to the usage of the -H,
+    --hourly option for details about COUNT.
+
   -H, --hourly=COUNT
 
     Set the number of hourly backups to preserve during rotation:
 
-    - If COUNT is an integer it gives the number of hourly backups to preserve,
+    - If COUNT is a number it gives the number of hourly backups to preserve,
       starting from the most recent hourly backup and counting back in time.
+    - Alternatively you can provide an expression that will be evaluated to get
+      a number (e.g. if COUNT is `7 * 2' the result would be 14).
     - You can also pass `always' for COUNT, in this case all hourly backups are
       preserved.
     - By default no hourly backups are preserved.
@@ -37,22 +52,22 @@ Supported options:
   -d, --daily=COUNT
 
     Set the number of daily backups to preserve during rotation. Refer to the
-    usage of the -H, --hourly option for details.
+    usage of the -H, --hourly option for details about COUNT.
 
   -w, --weekly=COUNT
 
     Set the number of weekly backups to preserve during rotation. Refer to the
-    usage of the -H, --hourly option for details.
+    usage of the -H, --hourly option for details about COUNT.
 
   -m, --monthly=COUNT
 
     Set the number of monthly backups to preserve during rotation. Refer to the
-    usage of the -H, --hourly option for details.
+    usage of the -H, --hourly option for details about COUNT.
 
   -y, --yearly=COUNT
 
     Set the number of yearly backups to preserve during rotation. Refer to the
-    usage of the -H, --hourly option for details.
+    usage of the -H, --hourly option for details about COUNT.
 
   -I, --include=PATTERN
 
@@ -65,6 +80,47 @@ Supported options:
     Don't process backups that match the shell pattern given by PATTERN. This
     argument can be repeated. Make sure to quote PATTERN so the shell doesn't
     expand the pattern before it's received by rotate-backups.
+
+  -j, --parallel
+
+    Remove backups in parallel, one backup per mount point at a time. The idea
+    behind this approach is that parallel rotation is most useful when the
+    files to be removed are on different disks and so multiple devices can be
+    utilized at the same time.
+
+    Because mount points are per system the -j, --parallel option will also
+    parallelize over backups located on multiple remote systems.
+
+  -p, --prefer-recent
+
+    By default the first (oldest) backup in each time slot is preserved. If
+    you'd prefer to keep the most recent backup in each time slot instead then
+    this option is for you.
+
+  -r, --relaxed
+
+    By default the time window for each rotation scheme is enforced (this is
+    referred to as strict rotation) but the -r, --relaxed option can be used
+    to alter this behavior. The easiest way to explain the difference between
+    strict and relaxed rotation is using an example:
+
+    - When using strict rotation and the number of hourly backups to preserve
+      is three, only backups created in the relevant time window (the hour of
+      the most recent backup and the two hours leading up to that) will match
+      the hourly frequency.
+
+    - When using relaxed rotation the three most recent backups will all match
+      the hourly frequency (and thus be preserved), regardless of the
+      calculated time window.
+
+    If the explanation above is not clear enough, here's a simple way to decide
+    whether you want to customize this behavior or not:
+
+    - If your backups are created at regular intervals and you never miss an
+      interval then strict rotation (the default) is probably the best choice.
+
+    - If your backups are created at irregular intervals then you may want to
+      use the -r, --relaxed option in order to preserve more backups.
 
   -i, --ionice=CLASS
 
@@ -80,6 +136,12 @@ Supported options:
     `/etc/rotate-backups.ini'. The first of these two configuration files to
     exist is loaded. For more details refer to the online documentation.
 
+  -u, --use-sudo
+
+    Enable the use of `sudo' to rotate backups in directories that are not
+    readable and/or writable for the current user (or the user logged in to a
+    remote system over SSH).
+
   -n, --dry-run
 
     Don't make any changes, just print what would be done. This makes it easy
@@ -87,7 +149,11 @@ Supported options:
 
   -v, --verbose
 
-    Make more noise (increase logging verbosity).
+    Make more noise (increase logging verbosity). Can be repeated.
+
+  -q, --quiet
+
+    Make less noise (decrease logging verbosity). Can be repeated.
 
   -h, --help
 
@@ -96,45 +162,48 @@ Supported options:
 
 # Standard library modules.
 import getopt
-import logging
-import logging.handlers
-import os
 import sys
 
 # External dependencies.
 import coloredlogs
-from humanfriendly import concatenate, parse_path
+from humanfriendly import concatenate, parse_path, pluralize
 from humanfriendly.terminal import usage
+from verboselogs import VerboseLogger
 
 # Modules included in our package.
-from rotate_backups import coerce_retention_period, load_config_file, RotateBackups
+from rotate_backups import (
+    RotateBackups,
+    coerce_location,
+    coerce_retention_period,
+    load_config_file,
+)
 
 # Initialize a logger.
-logger = logging.getLogger(__name__)
+logger = VerboseLogger(__name__)
 
 
 def main():
     """Command line interface for the ``rotate-backups`` program."""
-    coloredlogs.install()
-    if os.path.exists('/dev/log'):
-        handler = logging.handlers.SysLogHandler(address='/dev/log')
-        handler.setFormatter(logging.Formatter('%(module)s[%(process)d] %(levelname)s %(message)s'))
-        logger.addHandler(handler)
+    coloredlogs.install(syslog=True)
     # Command line option defaults.
-    config_file = None
-    dry_run = False
-    exclude_list = []
-    include_list = []
-    io_scheduling_class = None
     rotation_scheme = {}
+    kw = dict(include_list=[], exclude_list=[])
+    parallel = False
+    use_sudo = False
+    # Internal state.
+    selected_locations = []
     # Parse the command line arguments.
     try:
-        options, arguments = getopt.getopt(sys.argv[1:], 'H:d:w:m:y:I:x:i:c:nvh', [
-            'hourly=', 'daily=', 'weekly=', 'monthly=', 'yearly=', 'include=',
-            'exclude=', 'ionice=', 'config=', 'dry-run', 'verbose', 'help',
+        options, arguments = getopt.getopt(sys.argv[1:], 'M:H:d:w:m:y:I:x:jpri:c:r:unvqh', [
+            'minutely=', 'hourly=', 'daily=', 'weekly=', 'monthly=', 'yearly=',
+            'include=', 'exclude=', 'parallel', 'prefer-recent', 'relaxed',
+            'ionice=', 'config=', 'use-sudo', 'dry-run', 'verbose', 'quiet',
+            'help',
         ])
         for option, value in options:
-            if option in ('-H', '--hourly'):
+            if option in ('-M', '--minutely'):
+                rotation_scheme['minutely'] = coerce_retention_period(value)
+            elif option in ('-H', '--hourly'):
                 rotation_scheme['hourly'] = coerce_retention_period(value)
             elif option in ('-d', '--daily'):
                 rotation_scheme['daily'] = coerce_retention_period(value)
@@ -145,53 +214,71 @@ def main():
             elif option in ('-y', '--yearly'):
                 rotation_scheme['yearly'] = coerce_retention_period(value)
             elif option in ('-I', '--include'):
-                include_list.append(value)
+                kw['include_list'].append(value)
             elif option in ('-x', '--exclude'):
-                exclude_list.append(value)
+                kw['exclude_list'].append(value)
+            elif option in ('-j', '--parallel'):
+                parallel = True
+            elif option in ('-p', '--prefer-recent'):
+                kw['prefer_recent'] = True
+            elif option in ('-r', '--relaxed'):
+                kw['strict'] = False
             elif option in ('-i', '--ionice'):
                 value = value.lower().strip()
                 expected = ('idle', 'best-effort', 'realtime')
                 if value not in expected:
                     msg = "Invalid I/O scheduling class! (got %r while valid options are %s)"
                     raise Exception(msg % (value, concatenate(expected)))
-                io_scheduling_class = value
+                kw['io_scheduling_class'] = value
             elif option in ('-c', '--config'):
-                config_file = parse_path(value)
+                kw['config_file'] = parse_path(value)
+            elif option in ('-u', '--use-sudo'):
+                use_sudo = True
             elif option in ('-n', '--dry-run'):
                 logger.info("Performing a dry run (because of %s option) ..", option)
-                dry_run = True
+                kw['dry_run'] = True
             elif option in ('-v', '--verbose'):
                 coloredlogs.increase_verbosity()
+            elif option in ('-q', '--quiet'):
+                coloredlogs.decrease_verbosity()
             elif option in ('-h', '--help'):
                 usage(__doc__)
                 return
             else:
                 assert False, "Unhandled option! (programming error)"
         if rotation_scheme:
-            logger.debug("Parsed rotation scheme: %s", rotation_scheme)
-        # Make sure all of the directories given as arguments exist.
-        for pathname in arguments:
-            if not os.path.isdir(pathname):
-                msg = "Directory doesn't exist! (%s)"
-                raise Exception(msg % pathname)
-        # If no arguments are given but the system has a configuration file
-        # then the backups in the configured directories are rotated.
-        if not arguments:
-            arguments.extend(directory for directory, _, _ in load_config_file(config_file))
-        # Show the usage message when no directories are given nor configured.
-        if not arguments:
+            logger.verbose("Rotation scheme defined on command line: %s", rotation_scheme)
+        if arguments:
+            # Rotation of the locations given on the command line.
+            location_source = 'command line arguments'
+            selected_locations.extend(coerce_location(value, sudo=use_sudo) for value in arguments)
+        else:
+            # Rotation of all configured locations.
+            location_source = 'configuration file'
+            selected_locations.extend(
+                location
+                for location, rotation_scheme, options
+                in load_config_file(kw.get('config_file'))
+            )
+        # Inform the user which location(s) will be rotated.
+        if selected_locations:
+            logger.verbose("Selected %s based on %s:",
+                           pluralize(len(selected_locations), "location"),
+                           location_source)
+            for number, location in enumerate(selected_locations, start=1):
+                logger.verbose(" %i. %s", number, location)
+        else:
+            # Show the usage message when no directories are given nor configured.
+            logger.verbose("No location(s) to rotate selected.")
             usage(__doc__)
             return
     except Exception as e:
         logger.error("%s", e)
         sys.exit(1)
-    # Rotate the backups in the given or configured directories.
-    for pathname in arguments:
-        RotateBackups(
-            rotation_scheme=rotation_scheme,
-            include_list=include_list,
-            exclude_list=exclude_list,
-            io_scheduling_class=io_scheduling_class,
-            dry_run=dry_run,
-            config_file=config_file,
-        ).rotate_backups(pathname)
+    # Rotate the backups in the selected directories.
+    program = RotateBackups(rotation_scheme, **kw)
+    if parallel:
+        program.rotate_concurrent(*selected_locations)
+    else:
+        for location in selected_locations:
+            program.rotate_backups(location)

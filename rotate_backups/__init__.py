@@ -1,7 +1,7 @@
 # rotate-backups: Simple command line interface for backup rotation.
 #
 # Author: Peter Odding <peter@peterodding.com>
-# Last Change: August 5, 2016
+# Last Change: April 13, 2017
 # URL: https://github.com/xolox/python-rotate-backups
 
 """
@@ -22,6 +22,7 @@ import re
 
 # External dependencies.
 from dateutil.relativedelta import relativedelta
+from executor import ExternalCommandFailed
 from executor.concurrent import CommandPool
 from executor.contexts import RemoteContext, create_context
 from humanfriendly import Timer, coerce_boolean, format_path, parse_path, pluralize
@@ -41,7 +42,7 @@ from six.moves import configparser
 from verboselogs import VerboseLogger
 
 # Semi-standard module versioning.
-__version__ = '4.2'
+__version__ = '4.4'
 
 # Initialize a logger for this module.
 logger = VerboseLogger(__name__)
@@ -291,12 +292,15 @@ class RotateBackups(PropertyManager):
         """
         The I/O scheduling class for backup rotation (a string or :data:`None`).
 
-        When this property is set then ``ionice`` will be used to set the I/O
-        scheduling class for backup rotation. This can be useful to reduce the
-        impact of backup rotation on the rest of the system.
+        When this property is set (and :attr:`~Location.have_ionice` is
+        :data:`True`) then ionice_ will be used to set the I/O scheduling class
+        for backup rotation. This can be useful to reduce the impact of backup
+        rotation on the rest of the system.
 
         The value of this property is expected to be one of the strings 'idle',
         'best-effort' or 'realtime'.
+
+        .. _ionice: https://linux.die.net/man/1/ionice
         """
 
     @mutable_property
@@ -450,11 +454,11 @@ class RotateBackups(PropertyManager):
             else:
                 logger.info("Deleting %s ..", format_path(backup.pathname))
                 if not self.dry_run:
-                    command_line = ['rm', '-Rf', backup.pathname]
-                    if self.io_scheduling_class:
-                        command_line = ['ionice', '--class', self.io_scheduling_class] + command_line
-                    group_by = (location.ssh_alias, location.mount_point)
-                    command = location.context.prepare(*command_line, group_by=group_by)
+                    command = location.context.prepare(
+                        'rm', '-Rf', backup.pathname,
+                        group_by=(location.ssh_alias, location.mount_point),
+                        ionice=self.io_scheduling_class,
+                    )
                     rotation_commands.append(command)
                     if not prepare:
                         timer = Timer()
@@ -618,9 +622,24 @@ class Location(PropertyManager):
         """The pathname of a directory containing backups (a string)."""
 
     @lazy_property
+    def have_ionice(self):
+        """:data:`True` when ionice_ is available, :data:`False` otherwise."""
+        return self.context.have_ionice
+
+    @lazy_property
     def mount_point(self):
-        """The pathname of the mount point of :attr:`directory` (a string)."""
-        return self.context.capture('stat', '--format=%m', self.directory)
+        """
+        The pathname of the mount point of :attr:`directory` (a string or :data:`None`).
+
+        If the ``stat --format=%m ...`` command that is used to determine the
+        mount point fails, the value of this property defaults to :data:`None`.
+        This enables graceful degradation on e.g. Mac OS X whose ``stat``
+        implementation is rather bare bones compared to GNU/Linux.
+        """
+        try:
+            return self.context.capture('stat', '--format=%m', self.directory, silent=True)
+        except ExternalCommandFailed:
+            return None
 
     @lazy_property
     def is_remote(self):
